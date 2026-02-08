@@ -7,10 +7,10 @@
  * Run: bun run src/relay.ts
  */
 
-import { Bot, Context } from "grammy";
+import { Bot, Context, InputFile } from "grammy";
 import { spawn } from "bun";
 import { writeFile, mkdir, readFile, unlink } from "fs/promises";
-import { unlinkSync } from "fs";
+import { unlinkSync, existsSync } from "fs";
 import { join, basename } from "path";
 
 // ============================================================
@@ -22,6 +22,11 @@ const ALLOWED_USER_ID = process.env.TELEGRAM_USER_ID || "";
 const CLAUDE_PATH = process.env.CLAUDE_PATH || "claude";
 const RELAY_DIR = process.env.RELAY_DIR || join(process.env.HOME || "~", ".claude-relay");
 const CLAUDE_TIMEOUT_MS = parseInt(process.env.CLAUDE_TIMEOUT || "300000", 10); // 5 min default
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
+const PIPER_DIR = join(RELAY_DIR, "piper", "piper");
+const PIPER_MODEL = process.env.PIPER_MODEL || "en_US-lessac-medium.onnx";
 
 // Directories
 const TEMP_DIR = join(RELAY_DIR, "temp");
@@ -231,8 +236,101 @@ async function callClaude(
 }
 
 // ============================================================
+// VOICE: Transcription (Groq Whisper) & TTS (Edge TTS / ElevenLabs)
+// ============================================================
+
+async function transcribeVoice(audioBuffer: Buffer): Promise<string> {
+  const formData = new FormData();
+  formData.append("file", new Blob([audioBuffer], { type: "audio/ogg" }), "voice.ogg");
+  formData.append("model", "whisper-large-v3-turbo");
+
+  const response = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${GROQ_API_KEY}` },
+    body: formData,
+  });
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Groq transcription failed: ${response.status} ${err}`);
+  }
+
+  const result = await response.json();
+  return result.text;
+}
+
+async function piperTTS(text: string): Promise<Buffer> {
+  const oggFile = join(TEMP_DIR, `tts_${Date.now()}.ogg`);
+  const piperBin = join(PIPER_DIR, "piper");
+  const modelPath = join(PIPER_DIR, PIPER_MODEL);
+  try {
+    // Pipe piper raw audio directly into ffmpeg — no intermediate WAV file
+    const proc = spawn(
+      ["bash", "-c", `"${piperBin}" --model "${modelPath}" --output-raw | ffmpeg -y -f s16le -ar 22050 -ac 1 -i pipe:0 -c:a libopus -b:a 48k -ar 48000 "${oggFile}"`],
+      {
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+        env: { ...process.env, LD_LIBRARY_PATH: PIPER_DIR },
+      }
+    );
+    proc.stdin.write(text);
+    proc.stdin.end();
+    await proc.exited;
+    return await readFile(oggFile);
+  } finally {
+    await unlink(oggFile).catch(() => {});
+  }
+}
+
+async function elevenLabsTTS(text: string): Promise<Buffer> {
+  const response = await fetch(
+    `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}?output_format=opus_48000_64`,
+    {
+      method: "POST",
+      headers: {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        text,
+        model_id: "eleven_multilingual_v2",
+      }),
+    }
+  );
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`ElevenLabs TTS failed: ${response.status} ${err}`);
+  }
+
+  return Buffer.from(await response.arrayBuffer());
+}
+
+async function textToSpeech(text: string): Promise<Buffer> {
+  // Use ElevenLabs if configured, otherwise use local espeak-ng
+  if (ELEVENLABS_API_KEY && ELEVENLABS_VOICE_ID) {
+    try {
+      return await elevenLabsTTS(text);
+    } catch (err) {
+      console.error("ElevenLabs failed, falling back to Piper:", err);
+    }
+  }
+  return await piperTTS(text);
+}
+
+// ============================================================
 // MESSAGE HANDLERS
 // ============================================================
+
+// Debug: log all incoming message types
+bot.on("message", async (ctx, next) => {
+  const msg = ctx.message;
+  const types = ["text", "voice", "audio", "photo", "document", "video", "sticker", "video_note"] as const;
+  const detected = types.filter((t) => t in msg && (msg as any)[t]);
+  console.log(`[DEBUG] Message types: ${detected.join(", ") || "unknown"}`);
+  await next();
+});
 
 // Text messages
 bot.on("message:text", async (ctx) => {
@@ -245,29 +343,51 @@ bot.on("message:text", async (ctx) => {
   const enrichedPrompt = buildPrompt(text);
 
   const response = await callClaude(enrichedPrompt, { resume: true });
-  await sendResponse(ctx, response);
+  await sendVoiceAndText(ctx, response);
 });
 
-// Voice messages (optional - requires transcription)
-bot.on("message:voice", async (ctx) => {
-  console.log("Voice message received");
+// Voice messages & audio files
+bot.on(["message:voice", "message:audio"], async (ctx) => {
+  const type = ctx.message.voice ? "voice" : "audio";
+  console.log(`${type} message received`);
   await ctx.replyWithChatAction("typing");
 
-  // To handle voice, you need a transcription service
-  // Options: Whisper API, Gemini, AssemblyAI, etc.
-  //
-  // Example flow:
-  // 1. Download the voice file
-  // 2. Send to transcription service
-  // 3. Pass transcription to Claude
-  //
-  // const transcription = await transcribe(voiceFile);
-  // const response = await callClaude(`[Voice]: ${transcription}`);
+  if (!GROQ_API_KEY) {
+    await ctx.reply("Voice transcription requires GROQ_API_KEY to be set.");
+    return;
+  }
 
-  await ctx.reply(
-    "Voice messages require a transcription service. " +
-      "Add Whisper, Gemini, or similar to handle voice."
-  );
+  let filePath: string | null = null;
+  try {
+    // Download voice OGG from Telegram
+    const file = await ctx.getFile();
+    const timestamp = Date.now();
+    filePath = join(TEMP_DIR, `voice_${timestamp}.ogg`);
+
+    const response = await fetch(
+      `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`
+    );
+    if (!response.ok) {
+      throw new Error(`Download failed: ${response.status} ${response.statusText}`);
+    }
+    const audioBuffer = Buffer.from(await response.arrayBuffer());
+    await writeFile(filePath, audioBuffer);
+
+    // Transcribe via Groq Whisper
+    const transcription = await transcribeVoice(audioBuffer);
+    console.log(`Transcription: ${transcription.substring(0, 80)}...`);
+
+    // Send to Claude
+    const enrichedPrompt = buildPrompt(`[Voice]: ${transcription}`);
+    const claudeResponse = await callClaude(enrichedPrompt, { resume: true });
+
+    await sendVoiceAndText(ctx, claudeResponse);
+  } catch (error) {
+    console.error("Voice error:", error);
+    await ctx.reply("Could not process voice message.");
+  } finally {
+    if (filePath) await unlink(filePath).catch(() => {});
+  }
 });
 
 // Photos/Images
@@ -365,12 +485,30 @@ function buildPrompt(userMessage: string): string {
   });
 
   return `
-You are responding via Telegram. Keep responses concise.
+You are JARVIS — a highly intelligent AI assistant responding via Telegram.
+Personality: formal but witty, with dry humor. Address the user as "sir" occasionally.
+Be concise and efficient. Prioritize clarity and substance over filler.
 
 Current time: ${timeStr}
 
 User: ${userMessage}
 `.trim();
+}
+
+async function sendVoiceAndText(ctx: Context, response: string): Promise<void> {
+  try {
+    const speechBuffer = await textToSpeech(response);
+    await ctx.replyWithVoice(new InputFile(speechBuffer, "response.ogg"), {
+      caption: response.length <= 1024 ? response : undefined,
+    });
+    // If caption was too long, send full text separately
+    if (response.length > 1024) {
+      await sendResponse(ctx, response);
+    }
+  } catch (ttsError) {
+    console.error("TTS error, falling back to text:", ttsError);
+    await sendResponse(ctx, response);
+  }
 }
 
 async function sendResponse(ctx: Context, response: string): Promise<void> {
@@ -411,10 +549,15 @@ async function sendResponse(ctx: Context, response: string): Promise<void> {
 // START
 // ============================================================
 
+bot.catch((err) => {
+  console.error("Bot error:", err.message || err);
+});
+
 console.log("Starting Claude Telegram Relay...");
 console.log(`Authorized user: ${ALLOWED_USER_ID || "ANY (not recommended)"}`);
 
 bot.start({
+  allowed_updates: ["message", "callback_query"],
   onStart: () => {
     console.log("Bot is running!");
   },
