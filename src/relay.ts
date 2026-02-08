@@ -10,7 +10,8 @@
 import { Bot, Context } from "grammy";
 import { spawn } from "bun";
 import { writeFile, mkdir, readFile, unlink } from "fs/promises";
-import { join } from "path";
+import { unlinkSync } from "fs";
+import { join, basename } from "path";
 
 // ============================================================
 // CONFIGURATION
@@ -89,7 +90,7 @@ async function releaseLock(): Promise<void> {
 // Cleanup on exit
 process.on("exit", () => {
   try {
-    require("fs").unlinkSync(LOCK_FILE);
+    unlinkSync(LOCK_FILE);
   } catch {}
 });
 process.on("SIGINT", async () => {
@@ -111,6 +112,13 @@ if (!BOT_TOKEN) {
   console.log("1. Message @BotFather on Telegram");
   console.log("2. Create a new bot with /newbot");
   console.log("3. Copy the token to .env");
+  process.exit(1);
+}
+
+if (!ALLOWED_USER_ID) {
+  console.error("TELEGRAM_USER_ID not set!");
+  console.log("\nThis bot gives full Claude CLI access. Set TELEGRAM_USER_ID in .env");
+  console.log("to restrict access. Send /start to @userinfobot to get your ID.");
   process.exit(1);
 }
 
@@ -173,8 +181,9 @@ async function callClaude(
     });
 
     // Race Claude execution against a timeout
+    let timer: ReturnType<typeof setTimeout>;
     const timeout = new Promise<never>((_, reject) => {
-      setTimeout(() => reject(new Error("CLAUDE_TIMEOUT")), CLAUDE_TIMEOUT_MS);
+      timer = setTimeout(() => reject(new Error("CLAUDE_TIMEOUT")), CLAUDE_TIMEOUT_MS);
     });
 
     let output: string;
@@ -190,7 +199,9 @@ async function callClaude(
         ]),
         timeout,
       ]);
+      clearTimeout(timer!);
     } catch (err: any) {
+      clearTimeout(timer!);
       if (err?.message === "CLAUDE_TIMEOUT") {
         proc.kill();
         console.error(`Claude timed out after ${CLAUDE_TIMEOUT_MS / 1000}s`);
@@ -277,6 +288,9 @@ bot.on("message:photo", async (ctx) => {
     const response = await fetch(
       `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`
     );
+    if (!response.ok) {
+      throw new Error(`Download failed: ${response.status} ${response.statusText}`);
+    }
     const buffer = await response.arrayBuffer();
     await writeFile(filePath, Buffer.from(buffer));
 
@@ -305,12 +319,15 @@ bot.on("message:document", async (ctx) => {
   try {
     const file = await ctx.getFile();
     const timestamp = Date.now();
-    const fileName = doc.file_name || `file_${timestamp}`;
+    const fileName = basename(doc.file_name || `file_${timestamp}`);
     const filePath = join(UPLOADS_DIR, `${timestamp}_${fileName}`);
 
     const response = await fetch(
       `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`
     );
+    if (!response.ok) {
+      throw new Error(`Download failed: ${response.status} ${response.statusText}`);
+    }
     const buffer = await response.arrayBuffer();
     await writeFile(filePath, Buffer.from(buffer));
 
