@@ -20,6 +20,7 @@ const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const ALLOWED_USER_ID = process.env.TELEGRAM_USER_ID || "";
 const CLAUDE_PATH = process.env.CLAUDE_PATH || "claude";
 const RELAY_DIR = process.env.RELAY_DIR || join(process.env.HOME || "~", ".claude-relay");
+const CLAUDE_TIMEOUT_MS = parseInt(process.env.CLAUDE_TIMEOUT || "300000", 10); // 5 min default
 
 // Directories
 const TEMP_DIR = join(RELAY_DIR, "temp");
@@ -171,10 +172,32 @@ async function callClaude(
       },
     });
 
-    const output = await new Response(proc.stdout).text();
-    const stderr = await new Response(proc.stderr).text();
+    // Race Claude execution against a timeout
+    const timeout = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error("CLAUDE_TIMEOUT")), CLAUDE_TIMEOUT_MS);
+    });
 
-    const exitCode = await proc.exited;
+    let output: string;
+    let stderr: string;
+    let exitCode: number;
+
+    try {
+      [output, stderr, exitCode] = await Promise.race([
+        Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+          proc.exited,
+        ]),
+        timeout,
+      ]);
+    } catch (err: any) {
+      if (err?.message === "CLAUDE_TIMEOUT") {
+        proc.kill();
+        console.error(`Claude timed out after ${CLAUDE_TIMEOUT_MS / 1000}s`);
+        return `Error: Claude timed out after ${CLAUDE_TIMEOUT_MS / 1000} seconds.`;
+      }
+      throw err;
+    }
 
     if (exitCode !== 0) {
       console.error("Claude error:", stderr);
